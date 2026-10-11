@@ -1,108 +1,83 @@
-import json
-import logging
-import sys
+import math
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timezone
 
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
 EMAIL = "23f2001563@ds.study.iitm.ac.in"
-START = time.monotonic()
-MAX_LOGS = 1000
-# Probes and scrapers are counted in metrics but kept out of the log buffer,
-# so the log stays about real traffic.
-UNLOGGED_PATHS = {"/metrics", "/healthz", "/logs/tail"}
+ASSIGNED_ORIGIN = "https://app-7yp3qe.example.com"
+EXAM_ORIGIN = "https://exam.sanand.workers.dev"   # the exam page that runs the browser checks
+EXAM_ORIGIN_REGEX = r"https://([a-z0-9-]+\.)*sanand\.workers\.dev"
 
-request_count = 0
-log_buffer: deque = deque(maxlen=MAX_LOGS)
-
-# Structured logs: one JSON object per line on stdout (visible in Render's Logs tab).
-logger = logging.getLogger("app")
-logger.setLevel(logging.INFO)
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter("%(message)s"))
-logger.addHandler(_handler)
-logger.propagate = False
+RATE_LIMIT = 13      # requests per client per window
+WINDOW = 10.0        # seconds
 
 app = FastAPI()
 
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+_hits: dict = {}     # client id -> deque of request timestamps (sliding window)
 
 
+def _now() -> float:
+    return time.monotonic()
+
+
+# Middleware order: add_middleware() makes the LAST one added the OUTERMOST.
+# Request flow:  CORS -> request context -> rate limit -> route
+# So CORS headers and X-Request-ID are present even on 429 responses.
+
+# ---------- Middleware 3: per-client rate limit (innermost) ----------
 @app.middleware("http")
-async def observe(request: Request, call_next):
-    global request_count
-    request_count += 1                      # counts every request to every path
+async def rate_limit(request: Request, call_next):
+    client = (request.headers.get("x-client-id") or "").strip()
+    if request.method == "OPTIONS" or not client:
+        return await call_next(request)
 
+    now = _now()
+    if len(_hits) > 10000:  # housekeeping
+        for cid in [c for c, d in _hits.items() if not d or now - d[-1] >= WINDOW]:
+            del _hits[cid]
+
+    window = _hits.setdefault(client, deque())
+    while window and now - window[0] >= WINDOW:
+        window.popleft()
+    if len(window) >= RATE_LIMIT:
+        retry_after = max(1, math.ceil(window[0] + WINDOW - now))
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "rate limit exceeded", "request_id": request.state.request_id},
+            headers={"Retry-After": str(retry_after)},
+        )
+    window.append(now)
+    return await call_next(request)
+
+
+# ---------- Middleware 1: request context ----------
+@app.middleware("http")
+async def request_context(request: Request, call_next):
     rid = (request.headers.get("x-request-id") or "").strip() or str(uuid.uuid4())
     request.state.request_id = rid
-    started = time.perf_counter()
-    try:
-        response = await call_next(request)
-    except Exception:
-        response = JSONResponse(status_code=500, content={"detail": "internal error"})
+    response = await call_next(request)
     response.headers["X-Request-ID"] = rid
-
-    if request.url.path not in UNLOGGED_PATHS:
-        status = response.status_code
-        level = "ERROR" if status >= 500 else "WARNING" if status >= 400 else "INFO"
-        entry = {
-            "ts": _ts(),
-            "level": level,
-            "msg": "request",
-            "method": request.method,
-            "path": request.url.path,
-            "status": status,
-            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-            "request_id": rid,
-        }
-        log_buffer.append(entry)
-        logger.log(getattr(logging, level), json.dumps(entry))
     return response
 
 
+# ---------- Middleware 2: CORS (outermost) ----------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
+    allow_origins=[ASSIGNED_ORIGIN, EXAM_ORIGIN],
+    allow_origin_regex=EXAM_ORIGIN_REGEX,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["X-Request-ID", "X-Client-Id", "Content-Type"],
+    expose_headers=["X-Request-ID", "Retry-After"],
 )
 
 
-@app.get("/work")
-def work(n: int = Query(1, ge=0, le=1_000_000)):
-    checksum = 0
-    for i in range(n):                      # n real units of work
-        checksum = (checksum * 31 + i) % 1_000_003
-    return {"email": EMAIL, "done": n}
-
-
-@app.get("/metrics")
-def metrics():
-    body = (
-        "# HELP http_requests_total Total HTTP requests handled.\n"
-        "# TYPE http_requests_total counter\n"
-        f"http_requests_total {request_count}\n"
-    )
-    return PlainTextResponse(body, media_type="text/plain; version=0.0.4; charset=utf-8")
-
-
-@app.get("/healthz")
-def healthz():
-    return {"status": "ok", "uptime_s": round(time.monotonic() - START, 3)}
-
-
-@app.get("/logs/tail")
-def logs_tail(limit: int = 20):
-    limit = max(0, min(limit, MAX_LOGS))
-    return list(log_buffer)[-limit:] if limit else []
+@app.get("/ping")
+def ping(request: Request):
+    return {"email": EMAIL, "request_id": request.state.request_id}
 
 
 @app.get("/")
